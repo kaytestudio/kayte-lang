@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# picokayte - Kayte for microcontrollers: turns a Kayte program (.kayte or
+# .kjs) into an Arduino sketch or an ESP-IDF project for ESP32 boards.
+#
+# The program is compiled with `kayte --native` to C, which is built with
+# the board's own toolchain together with the Kayte native runtime
+# (source/native/kayte_native_rt.c, in its KAYTE_EMBEDDED mode) and a small
+# HAL (picokayte/hal) for the serial port, the pins and the clock. So the
+# whole language works on the board, plus PINMODE, DIGITALWRITE,
+# DIGITALREAD, ANALOGREAD, ANALOGWRITE, DELAY, MILLIS and MICROS.
+# See picokayte/README.md.
+#
+# Usage:
+#   picokayte arduino PROGRAM [-o DIR] [--baud N] [--fqbn FQBN [--port PORT]]
+#   picokayte esp-idf PROGRAM [-o DIR] [--stack BYTES] [--target CHIP [--port PORT]]
+#
+#   arduino   writes an Arduino sketch, DIR (default: the program's name),
+#             for the Arduino IDE or arduino-cli: any board whose core has
+#             a 32-bit CPU - ESP32, ESP8266, RP2040, SAMD, Uno R4, STM32 ...
+#             With --fqbn (e.g. esp32:esp32:esp32) it's also compiled with
+#             arduino-cli, and with --port uploaded.
+#   esp-idf   writes an ESP-IDF 5.x project, DIR (default: NAME-idf). With
+#             --target (esp32, esp32s3, esp32c3 ...) it's also built with
+#             idf.py, and with --port flashed.
+#
+# Environment:
+#   KAYTE            the kayte compiler (default: bin/kayte of this
+#                    repository, then kayte on PATH)
+#   KAYTE_NATIVE_RT  the directory holding kayte_native_rt.c (default:
+#                    source/native of this repository)
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+
+die() { echo "picokayte: $*" >&2; exit 1; }
+
+usage() {
+    sed -n '/^# Usage:/,/^# Environment:/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+[ $# -ge 1 ] || usage 1
+case "$1" in -h|--help|help) usage 0 ;; esac
+MODE="$1"
+shift
+case "$MODE" in arduino|esp-idf) ;; *) die "unknown target \"$MODE\" (arduino or esp-idf)" ;; esac
+[ $# -ge 1 ] || usage 1
+PROGRAM="$1"
+shift
+
+OUT="" BAUD=115200 STACK=16384 FQBN="" PORT="" IDF_TARGET=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) OUT="${2:?-o needs a directory}"; shift 2 ;;
+        --baud) BAUD="${2:?--baud needs a number}"; shift 2 ;;
+        --stack) STACK="${2:?--stack needs a number}"; shift 2 ;;
+        --fqbn) FQBN="${2:?--fqbn needs a board, e.g. esp32:esp32:esp32}"; shift 2 ;;
+        --port) PORT="${2:?--port needs a serial port}"; shift 2 ;;
+        --target) IDF_TARGET="${2:?--target needs a chip, e.g. esp32}"; shift 2 ;;
+        -h|--help) usage 0 ;;
+        *) die "unknown option \"$1\"" ;;
+    esac
+done
+[[ "$BAUD" =~ ^[0-9]+$ ]] || die "--baud must be a number"
+[[ "$STACK" =~ ^[0-9]+$ ]] || die "--stack must be a number"
+[ -f "$PROGRAM" ] || die "no such file: $PROGRAM"
+if [ "$MODE" = arduino ] && [ -n "$IDF_TARGET" ]; then die "--target is for esp-idf (use --fqbn)"; fi
+if [ "$MODE" = esp-idf ] && [ -n "$FQBN" ]; then die "--fqbn is for arduino (use --target)"; fi
+
+# The compiler and the runtime
+KAYTE="${KAYTE:-}"
+if [ -z "$KAYTE" ]; then
+    if [ -x "$REPO_ROOT/bin/kayte" ]; then
+        KAYTE="$REPO_ROOT/bin/kayte"
+    elif command -v kayte >/dev/null 2>&1; then
+        KAYTE="$(command -v kayte)"
+    else
+        die "can't find kayte - build it (scripts/build-kayte-macos.sh) or set KAYTE"
+    fi
+fi
+RT_DIR="${KAYTE_NATIVE_RT:-$REPO_ROOT/source/native}"
+RUNTIME="$RT_DIR/kayte_native_rt.c"
+[ -f "$RUNTIME" ] || die "can't find kayte_native_rt.c in $RT_DIR - set KAYTE_NATIVE_RT"
+
+# The program's name: the sketch / project name. Arduino wants the sketch
+# directory and its .ino to have the same name, of letters, digits and _.
+BASE="$(basename "$PROGRAM")"
+NAME="$(printf '%s' "${BASE%.*}" | tr -c 'A-Za-z0-9_\n' '_')"
+if [ -z "$OUT" ]; then
+    if [ "$MODE" = arduino ]; then OUT="$NAME"; else OUT="$NAME-idf"; fi
+fi
+if [ "$MODE" = arduino ]; then
+    NAME="$(basename "$OUT" | tr -c 'A-Za-z0-9_\n' '_')"
+fi
+
+if [ "$MODE" = arduino ]; then SRC="$OUT"; else SRC="$OUT/main"; fi
+mkdir -p "$SRC"
+
+# kayte --native writes the C only when the output ends in .c.
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+if ! "$KAYTE" --native "$PROGRAM" -o "$TMP/program.c" > "$TMP/log" 2>&1; then
+    cat "$TMP/log" >&2
+    die "kayte couldn't compile $PROGRAM"
+fi
+[ -f "$TMP/program.c" ] || { cat "$TMP/log" >&2; die "kayte wrote no C for $PROGRAM"; }
+
+# The runtime goes in as kayte_rt.h: a sketch builds every .c it has, and
+# the runtime can only be built #included by the program.
+{
+    echo "/* Built by picokayte from $BASE - change that and run picokayte again. */"
+    echo "#define KAYTE_EMBEDDED 1"
+    sed 's|^#include "kayte_native_rt.c"$|#include "kayte_rt.h"|' "$TMP/program.c"
+} > "$SRC/kayte_program.c"
+grep -q '^#include "kayte_rt.h"$' "$SRC/kayte_program.c" || die "unexpected C from kayte (no #include of the runtime)"
+cp "$RUNTIME" "$SRC/kayte_rt.h"
+cp "$HERE/hal/picokayte.h" "$SRC/picokayte.h"
+cat > "$SRC/picokayte_config.h" <<EOF
+/* Written by picokayte. */
+#define PICOKAYTE_BAUD $BAUD
+#define PICOKAYTE_STACK $STACK
+EOF
+
+if [ "$MODE" = arduino ]; then
+    cp "$HERE/hal/arduino/picokayte_hal.cpp" "$SRC/picokayte_hal.cpp"
+    cat > "$SRC/$NAME.ino" <<EOF
+// $NAME: the Kayte program $BASE, built by picokayte.
+// The program is in kayte_program.c; change $BASE and run picokayte again.
+// PRINT and INPUT use the serial port, at $BAUD baud.
+#include "picokayte.h"
+
+#if defined(ARDUINO_ARCH_ESP32) && defined(SET_LOOP_TASK_STACK_SIZE)
+SET_LOOP_TASK_STACK_SIZE($STACK);
+#endif
+
+void setup() {
+  picokayte_run(); // the whole program, to its end
+}
+
+void loop() {
+  picokayte_idle();
+}
+EOF
+    echo "Arduino sketch: $OUT/$NAME.ino"
+    if [ -n "$FQBN" ]; then
+        command -v arduino-cli >/dev/null 2>&1 || die "--fqbn needs arduino-cli (https://arduino.github.io/arduino-cli)"
+        UPLOAD=()
+        if [ -n "$PORT" ]; then UPLOAD=(--upload --port "$PORT"); fi
+        arduino-cli compile --fqbn "$FQBN" "${UPLOAD[@]+"${UPLOAD[@]}"}" "$OUT"
+    elif [ -n "$PORT" ]; then
+        die "--port needs --fqbn"
+    else
+        echo "Open it in the Arduino IDE, or: arduino-cli compile --fqbn esp32:esp32:esp32 --upload --port PORT $OUT"
+    fi
+else
+    cp "$HERE/hal/esp-idf/picokayte_hal.c" "$SRC/picokayte_hal.c"
+    cat > "$OUT/CMakeLists.txt" <<EOF
+# $NAME: the Kayte program $BASE, built by picokayte.
+cmake_minimum_required(VERSION 3.16)
+include(\$ENV{IDF_PATH}/tools/cmake/project.cmake)
+project($NAME)
+EOF
+    cat > "$SRC/CMakeLists.txt" <<'EOF'
+# The drivers moved into components of their own in ESP-IDF 5.3.
+if(IDF_VERSION_MAJOR GREATER 5 OR (IDF_VERSION_MAJOR EQUAL 5 AND IDF_VERSION_MINOR GREATER_EQUAL 3))
+    set(drivers esp_driver_gpio esp_driver_ledc)
+else()
+    set(drivers driver)
+endif()
+idf_component_register(SRCS "kayte_program.c" "picokayte_hal.c"
+                       INCLUDE_DIRS "."
+                       PRIV_REQUIRES ${drivers} esp_adc esp_timer)
+# The runtime is shared with the desktop builds, which build it with -w too.
+target_compile_options(${COMPONENT_LIB} PRIVATE -w)
+EOF
+    cat > "$OUT/sdkconfig.defaults" <<'EOF'
+# A Kayte loop that never calls DELAY keeps its core busy: don't report
+# that as a hung idle task.
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+EOF
+    echo "ESP-IDF project: $OUT"
+    if [ -n "$IDF_TARGET" ]; then
+        command -v idf.py >/dev/null 2>&1 || die "--target needs ESP-IDF's idf.py (run its export.sh first)"
+        FLASH=()
+        if [ -n "$PORT" ]; then FLASH=(-p "$PORT" flash); fi
+        (cd "$OUT" && idf.py set-target "$IDF_TARGET" && idf.py build "${FLASH[@]+"${FLASH[@]}"}")
+    elif [ -n "$PORT" ]; then
+        die "--port needs --target"
+    else
+        echo "Build and flash it: cd $OUT && idf.py set-target esp32 && idf.py -p PORT flash monitor"
+    fi
+fi

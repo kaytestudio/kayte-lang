@@ -28,6 +28,11 @@ const
   // messages (ERROR n), MID$ = , LSET / RSET
   BI_BAND = 80; BI_BOR = 81; BI_BXOR = 82; BI_BNOT = 83; BI_ERRCODE = 84; BI_ERRMSG = 85;
   BI_MIDSET = 86; BI_LSET = 87; BI_RSET = 88;
+  // Microcontroller I/O (PicoKayte, picokayte/): Arduino-style pins and
+  // timing. On a microcontroller the native runtime drives the hardware;
+  // the VM and desktop builds simulate them (KAYTE_GPIO_TRACE=1 logs them).
+  BI_PINMODE = 89; BI_DIGITALWRITE = 90; BI_DIGITALREAD = 91; BI_ANALOGREAD = 92;
+  BI_ANALOGWRITE = 93; BI_DELAY = 94; BI_MILLIS = 95; BI_MICROS = 96;
 
   // BC_QPRINT's Operand1: QuickBASIC-style PRINT pieces (no newline unless
   // QP_NEWLINE). The runtime tracks the output column for QP_COMMA / QP_TAB.

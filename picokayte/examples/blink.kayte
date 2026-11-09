@@ -1,0 +1,14 @@
+' Blink: the "hello world" of microcontrollers.
+' Build for a board with: picokayte/picokayte arduino picokayte/examples/blink.kayte
+' (or try it on the desktop: KAYTE_GPIO_TRACE=1 kayte --native blink.kayte -o blink)
+CONST LED = 2                    ' GPIO 2: the on-board LED of most ESP32 DevKits
+
+PinMode LED, OUTPUT
+PRINT "Blinking pin " & LED
+FOR i = 1 TO 5
+    DigitalWrite LED, HIGH
+    Delay 250
+    DigitalWrite LED, LOW
+    Delay 250
+NEXT
+PRINT "Done after " & Millis() & " ms"

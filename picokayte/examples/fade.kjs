@@ -1,0 +1,19 @@
+// Fade: an LED breathes with PWM, in Kayte's JavaScript-like syntax.
+// Any pin with PWM works; GPIO 2 is the on-board LED of most ESP32 DevKits.
+const LED = 2;
+
+function fade(from, to, step) {
+  for (let duty = from; duty != to; duty += step) {
+    analogWrite(LED, duty);
+    delay(4);
+  }
+}
+
+pinMode(LED, OUTPUT);
+print("Fading pin", LED);
+for (let round = 1; round <= 10; round += 1) {
+  fade(0, 255, 1);
+  fade(255, 0, -1);
+}
+digitalWrite(LED, LOW);
+print("Done");

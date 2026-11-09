@@ -438,31 +438,35 @@ end;
 const
   // Built-in functions: name, BI_* id, fewest and most arguments (-1: any).
   // A trailing "$" (LEFT$, CHR$ ...) is accepted and ignored.
-  BuiltinCount = 49;
+  BuiltinCount = 57;
   BuiltinNames: array[0..BuiltinCount - 1] of string = (
     'LEN', 'LEFT', 'RIGHT', 'MID', 'UCASE', 'LCASE', 'TRIM', 'LTRIM', 'RTRIM', 'INSTR',
     'REPLACE', 'STR', 'VAL', 'CHR', 'ASC', 'SPACE', 'ABS', 'SGN', 'MIN', 'MAX',
     'UBOUND', 'LBOUND', 'ARRAY', 'JOIN', 'SPLIT', 'TYPENAME', 'ISARRAY', 'ISNUMERIC', 'CINT', 'RND',
     'CSTR', 'CLNG', 'UPPER', 'LOWER', 'INT', 'FIX', 'SQR', 'STRING', 'HEX', 'OCT',
-    'CDBL', 'CSNG', 'ROUND', 'SIN', 'COS', 'TAN', 'ATN', 'EXP', 'LOG');
+    'CDBL', 'CSNG', 'ROUND', 'SIN', 'COS', 'TAN', 'ATN', 'EXP', 'LOG',
+    'PINMODE', 'DIGITALWRITE', 'DIGITALREAD', 'ANALOGREAD', 'ANALOGWRITE', 'DELAY', 'MILLIS', 'MICROS');
   BuiltinIds: array[0..BuiltinCount - 1] of Integer = (
     BI_LEN, BI_LEFT, BI_RIGHT, BI_MID, BI_UCASE, BI_LCASE, BI_TRIM, BI_LTRIM, BI_RTRIM, BI_INSTR,
     BI_REPLACE, BI_STR, BI_VAL, BI_CHR, BI_ASC, BI_SPACE, BI_ABS, BI_SGN, BI_MIN, BI_MAX,
     BI_UBOUND, BI_LBOUND, BI_ARRAY, BI_JOIN, BI_SPLIT, BI_TYPENAME, BI_ISARRAY, BI_ISNUMERIC, BI_CINT, BI_RND,
     BI_STR, BI_CINT, BI_UCASE, BI_LCASE, BI_INT, BI_FIX, BI_SQR, BI_STRING, BI_HEX, BI_OCT,
-    BI_CDBL, BI_CDBL, BI_ROUND, BI_SIN, BI_COS, BI_TAN, BI_ATN, BI_EXP, BI_LOG);
+    BI_CDBL, BI_CDBL, BI_ROUND, BI_SIN, BI_COS, BI_TAN, BI_ATN, BI_EXP, BI_LOG,
+    BI_PINMODE, BI_DIGITALWRITE, BI_DIGITALREAD, BI_ANALOGREAD, BI_ANALOGWRITE, BI_DELAY, BI_MILLIS, BI_MICROS);
   BuiltinMin: array[0..BuiltinCount - 1] of Integer = (
     1, 2, 2, 2, 1, 1, 1, 1, 1, 2,
     3, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 0, 1, 1, 1, 1, 1, 1, 0,
     1, 1, 1, 1, 1, 1, 1, 2, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1);
+    1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 1, 1, 2, 1, 0, 0);
   BuiltinMax: array[0..BuiltinCount - 1] of Integer = (
     1, 2, 2, 3, 1, 1, 1, 1, 1, 3,
     3, 1, 1, 1, 1, 1, 1, 1, -1, -1,
     2, 2, -1, 2, 2, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 2, 1, 1,
-    1, 1, 2, 1, 1, 1, 1, 1, 1);
+    1, 1, 2, 1, 1, 1, 1, 1, 1,
+    2, 2, 1, 1, 2, 1, 0, 0);
 
 // Whether T is a number with a fraction or exponent ("2.5", "-.5", "1E3").
 function IsFloatText(const T: string): Boolean;
@@ -537,6 +541,29 @@ begin
         Result := BI_QBSTR;
       Exit;
     end;
+end;
+
+// The microcontroller built-ins that also work as statements (their value
+// is always 0).
+function IsIOStatement(Id: Integer): Boolean;
+begin
+  Result := (Id = BI_PINMODE) or (Id = BI_DIGITALWRITE) or (Id = BI_ANALOGWRITE) or (Id = BI_DELAY);
+end;
+
+// Arduino's names for pin levels and modes, or -1. INPUT is a keyword:
+// the PINMODE statement takes it (and the names as strings, "INPUT"). A
+// variable of the same name hides them.
+function IOConstant(const U: string): Integer;
+begin
+  case U of
+    'LOW': Result := 0;
+    'HIGH': Result := 1;
+    'OUTPUT': Result := 1;
+    'INPUT_PULLUP': Result := 2;
+    'INPUT_PULLDOWN': Result := 3;
+  else
+    Result := -1;
+  end;
 end;
 
 { TParser }
@@ -4791,7 +4818,7 @@ var
   P: TPlace;
   Name, U, MName: string;
   Line, MinA, MaxA, Id, Obj, I: Integer;
-  IsLocal, IsCatchVar, IsStatement, IsTarget, Exact: Boolean;
+  IsLocal, IsCatchVar, IsStatement, IsTarget, Exact, Paren: Boolean;
   Cur, Static: TClassInfo;
 
   // After a call compiled as a statement (no value): if the chain goes on
@@ -4909,6 +4936,37 @@ begin
       CallExpression(Name, Line, not IsStatement, IsStatement);
       CallResult(not IsStatement);
     end
+    else if IsStatement and not AtAssign and IsIOStatement(FindBuiltin(Name, FQB, MinA, MaxA)) then
+    begin
+      // PINMODE / DIGITALWRITE / ANALOGWRITE / DELAY are statements too:
+      // "DigitalWrite 2, 1" or "DigitalWrite(2, 1)".
+      Id := FindBuiltin(Name, FQB, MinA, MaxA);
+      Paren := Check(tkParenthesisOpen); // the arguments are in (...)
+      if Paren then
+        Advance;
+      I := 0;
+      if not (Paren and Check(tkParenthesisClose)) and not (not Paren and AtStatementEnd) then
+        repeat
+          if (Id = BI_PINMODE) and (I = 1) and AtKeyword('INPUT') then
+          begin
+            Advance; // INPUT is a keyword: PinMode 4, INPUT
+            EmitInt(0);
+          end
+          else
+            Expression;
+          Inc(I);
+          if not Check(tkComma) then
+            Break;
+          Advance;
+        until False;
+      if Paren then
+        Match(tkParenthesisClose);
+      if (I < MinA) or (I > MaxA) then
+        Error(Format('%s takes %d argument(s), not %d', [UpperCase(Name), MinA, I]));
+      FAssembler.Emit(BC_BUILTIN, [Id, I]);
+      FAssembler.Emit(BC_POP, []);
+      P.Kind := pkNone;
+    end
     else if not IsTarget and Check(tkParenthesisOpen) and (FindBuiltin(Name, FQB, MinA, MaxA) > 0) then
     begin
       Id := FindBuiltin(Name, FQB, MinA, MaxA);
@@ -4929,6 +4987,11 @@ begin
     else if (Mode = cmExpr) and (QBNoArgBuiltin(U) > 0) and not IsKnownVar(Name) then
     begin
       FAssembler.Emit(BC_BUILTIN, [QBNoArgBuiltin(U), 0]);
+      P.Kind := pkValue;
+    end
+    else if (Mode = cmExpr) and (IOConstant(U) >= 0) and not IsKnownVar(Name) then
+    begin
+      EmitInt(IOConstant(U)); // DigitalWrite 2, HIGH
       P.Kind := pkValue;
     end
     else if (U = 'RND') and (Mode = cmExpr) and not Check(tkParenthesisOpen) and not IsKnownVar(Name) then

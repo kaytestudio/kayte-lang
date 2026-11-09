@@ -1,0 +1,37 @@
+' Thermostat: reads a sensor on an analog pin, smooths it, and switches a
+' relay (or LED) with a little hysteresis. Shows that the whole language
+' runs on the board: a class, an array and functions.
+CONST SENSOR = 34                ' an ADC1 pin on the ESP32 (A0 on most Arduinos)
+CONST RELAY = 2
+
+CLASS Smoother                   ' the average of the last few readings
+    PRIVATE samples(7), count = 0, total = 0
+
+    FUNCTION Add(value)
+        slot = count MOD 8
+        total = total - samples(slot) + value
+        samples(slot) = value
+        count = count + 1
+        RETURN total / MIN(count, 8)
+    END FUNCTION
+END CLASS
+
+FUNCTION ToPercent(raw)
+    RETURN ROUND(raw * 100 / 4095, 1)   ' ESP32: 12-bit readings, 0 - 4095
+END FUNCTION
+
+PinMode RELAY, OUTPUT
+DIM s AS NEW Smoother
+setPoint = 50
+heating = FALSE
+
+PRINT "Set point " & setPoint & "%"
+FOR i = 1 TO 600                 ' about a minute
+    level = ToPercent(s.Add(AnalogRead(SENSOR)))
+    IF heating AND level > setPoint + 2 THEN heating = FALSE
+    IF NOT heating AND level < setPoint - 2 THEN heating = TRUE
+    DigitalWrite RELAY, heating
+    IF i MOD 10 = 0 THEN PRINT "level " & level & "%, heating: " & heating
+    Delay 100
+NEXT
+DigitalWrite RELAY, LOW

@@ -76,6 +76,13 @@ type
      FFileCol: array[1..255] of Int64;
      FFileLen: array[1..255] of Int64; // RANDOM: the record length
      FFileRec: array[1..255] of Int64; // RANDOM: the last record read or written
+     // Simulated microcontroller pins (PINMODE, DIGITALWRITE ...): mode
+     // (-1 never set) and level / PWM duty; MILLIS counts from FStartTicks.
+     FPinMode: array[0..255] of ShortInt;
+     FPinLevel: array[0..255] of Int64;
+     FStartTicks: QWord;
+     FGpioTrace: Boolean; // KAYTE_GPIO_TRACE: log pin changes to stderr
+     function IOBuiltin(Id: Integer; const Args: array of TKayteValue): TKayteValue;
      procedure NeedOpen(Num: Int64);
      function BinSeek(Num, Pos: Int64; out RecLen: Int64): Pointer;
      procedure PutValue(var B: string; const L: string; var P: Integer; const V: TKayteValue);
@@ -137,6 +144,9 @@ begin
   FInstructionPointer := 0;
   FStackTop := 0;
   FQtHandlers := TQtHandlerMap.Create;
+  FillChar(FPinMode, SizeOf(FPinMode), $FF);
+  FStartTicks := GetTickCount64;
+  FGpioTrace := GetEnvironmentVariable('KAYTE_GPIO_TRACE') <> '';
 
   // AProgram's memory isn't owned here - the caller
   // (TCLIHandler.RunBytecodeFile) frees it after the VM is done.
@@ -1123,6 +1133,8 @@ begin
         Result := MakeInt(0);
       end;
     BI_INKEY: Result := MakeStr('');
+    BI_PINMODE, BI_DIGITALWRITE, BI_DIGITALREAD, BI_ANALOGREAD, BI_ANALOGWRITE, BI_DELAY, BI_MILLIS, BI_MICROS:
+      Result := IOBuiltin(Id, Args);
     BI_USING: Result := FormatUsing(Args);
     BI_BAND: Result := MakeInt(N(0) and N(1));
     BI_BOR: Result := MakeInt(N(0) or N(1));
@@ -1950,6 +1962,95 @@ begin
     until False;
     while (Result <> '') and (Result[Length(Result)] in [' ', #9, #13]) do
       SetLength(Result, Length(Result) - 1);
+  end;
+end;
+
+// Microcontroller I/O, simulated: pins keep what was written to them (an
+// input reads 0, or 1 with a pull-up) and ANALOGREAD gives 0. The native
+// runtime (kayte_native_rt.c) simulates them the same way, and drives the
+// real pins when built for a board by picokayte.
+function TVirtualMachine.IOBuiltin(Id: Integer; const Args: array of TKayteValue): TKayteValue;
+const
+  ModeNames: array[0..3] of string = ('INPUT', 'OUTPUT', 'INPUT_PULLUP', 'INPUT_PULLDOWN');
+var
+  Pin, V: Int64;
+  Mode: Integer;
+  Name: string;
+
+  procedure Fail(const Msg: string);
+  begin
+    raise Exception.Create('Runtime Error: ' + Msg);
+  end;
+
+  procedure Trace(const Msg: string);
+  begin
+    if FGpioTrace then
+    begin
+      Flush(System.Output);
+      Writeln(StdErr, '[gpio] ', Msg);
+    end;
+  end;
+
+begin
+  Result := MakeInt(0);
+  Pin := 0;
+  if Id in [BI_PINMODE, BI_DIGITALWRITE, BI_DIGITALREAD, BI_ANALOGREAD, BI_ANALOGWRITE] then
+  begin
+    Pin := ToInt(Args[0]);
+    if (Pin < 0) or (Pin > High(FPinMode)) then
+      Fail(Format('pin %d is out of range (0 to %d)', [Pin, High(FPinMode)]));
+  end;
+  case Id of
+    BI_PINMODE:
+      begin
+        Mode := -1;
+        if Args[1].Kind = vkStr then
+        begin
+          Name := UpperCase(Trim(Args[1].StrVal));
+          for V := 0 to High(ModeNames) do
+            if ModeNames[V] = Name then
+              Mode := V;
+        end
+        else
+        begin
+          V := ToInt(Args[1]);
+          if (V >= 0) and (V <= High(ModeNames)) then
+            Mode := V;
+        end;
+        if Mode < 0 then
+          Fail('PINMODE: unknown mode "' + ToDisplayString(Args[1]) +
+            '" (INPUT, OUTPUT, INPUT_PULLUP or INPUT_PULLDOWN)');
+        FPinMode[Pin] := Mode;
+        if Mode = 2 then
+          FPinLevel[Pin] := 1
+        else if Mode = 3 then
+          FPinLevel[Pin] := 0;
+        Trace(Format('pinMode %d %s', [Pin, ModeNames[Mode]]));
+      end;
+    BI_DIGITALWRITE:
+      begin
+        FPinLevel[Pin] := Ord(IsTruthy(Args[1]));
+        Trace(Format('pin %d = %d', [Pin, FPinLevel[Pin]]));
+      end;
+    BI_DIGITALREAD: Result := MakeInt(Ord(FPinLevel[Pin] <> 0));
+    BI_ANALOGREAD: Result := MakeInt(0);
+    BI_ANALOGWRITE:
+      begin
+        V := ToInt(Args[1]);
+        if (V < 0) or (V > 255) then
+          Fail(Format('ANALOGWRITE: the value must be 0 to 255, not %d', [V]));
+        FPinLevel[Pin] := V;
+        Trace(Format('pin %d pwm %d', [Pin, V]));
+      end;
+    BI_DELAY:
+      begin
+        Flush(System.Output);
+        V := ToInt(Args[0]);
+        if V > 0 then
+          Sleep(V);
+      end;
+    BI_MILLIS: Result := MakeInt(GetTickCount64 - FStartTicks);
+    BI_MICROS: Result := MakeInt((GetTickCount64 - FStartTicks) * 1000);
   end;
 end;
 

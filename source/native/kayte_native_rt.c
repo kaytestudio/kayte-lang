@@ -35,6 +35,12 @@
  * (e.g. QML "load") find bundled files - and WebAssembly (WASI), which has
  * neither processes nor loadable libraries, so PROCESS and QT are errors.
  *
+ * With KAYTE_EMBEDDED it's built for a microcontroller (ESP32, Arduino
+ * boards) by picokayte (picokayte/README.md): PRINT / INPUT, the pins and
+ * the clock go through the board's HAL (picokayte.h), the program's main()
+ * is kayte_main(), and a runtime error stops in kayte_hal_fatal(). Without
+ * it, PINMODE, DIGITALWRITE ... are simulated exactly as the VM does.
+ *
  * Two ways to build it:
  *   - #included by the C that `kayte --native` generates (the default): the
  *     program's tables (K_sub_names, ...) are defined before the #include
@@ -70,7 +76,7 @@
 #else
 #include <strings.h>
 #include <unistd.h>
-#ifndef __wasi__
+#if !defined(__wasi__) && !defined(KAYTE_EMBEDDED)
 #include <dlfcn.h>
 #include <sys/wait.h>
 #endif
@@ -88,7 +94,11 @@
 #endif
 
 /* Platforms without other processes / loadable libraries. */
-#if defined(KAYTE_APPLE_MOBILE)
+#if defined(KAYTE_EMBEDDED)
+#include "picokayte.h"
+#define KAYTE_NO_PROCESS "a microcontroller"
+#define KAYTE_NO_DYNLOAD 1
+#elif defined(KAYTE_APPLE_MOBILE)
 #define KAYTE_NO_PROCESS "iOS/tvOS (apps can't start other programs)"
 #define KAYTE_NO_DYNLOAD 1 /* Qt is linked in instead (KAYTE_QT_STATIC) */
 #elif defined(__wasi__)
@@ -100,6 +110,27 @@
 #endif
 #ifndef KAYTE_NO_SETJMP
 #include <setjmp.h>
+#endif
+
+/* The program's output and input: the console, or the board's serial port. */
+#ifdef KAYTE_EMBEDDED
+#define K_WRITE(s, n) kayte_hal_write((s), (n))
+#define K_FLUSH() kayte_hal_flush()
+#define K_GETC() kayte_hal_getc()
+#else
+#define K_WRITE(s, n) fwrite((s), 1, (n), stdout)
+#define K_FLUSH() fflush(stdout)
+#define K_GETC() getchar()
+#endif
+
+/* The generated program's entry point (kayte_main on a microcontroller,
+ * called by the board's setup() / app_main()). */
+#ifndef KAYTE_MAIN
+#ifdef KAYTE_EMBEDDED
+#define KAYTE_MAIN kayte_main
+#else
+#define KAYTE_MAIN main
+#endif
 #endif
 
 /* Entry points the generated program calls: static when the program
@@ -161,9 +192,13 @@ RT_API void rt_error(const char *fmt, ...)
         va_end(ap);
         rt_catch(msg); /* to the CATCH of an active TRY, if any */
     }
+#ifdef KAYTE_EMBEDDED
+    kayte_hal_fatal(msg ? msg : "out of memory");
+#else
     fflush(stdout);
     fprintf(stderr, "Runtime Error: %s\n", msg ? msg : "out of memory");
     exit(1);
+#endif
 }
 
 static void *rt_alloc(size_t n)
@@ -506,7 +541,13 @@ typedef struct {
     int argc; /* arguments pushed for the SUB, checked by rt_enter */
 } kframe;
 
+#ifndef K_MAX_CALL_DEPTH
+#ifdef KAYTE_EMBEDDED
+#define K_MAX_CALL_DEPTH 256 /* 2 KB of RAM */
+#else
 #define K_MAX_CALL_DEPTH 10000
+#endif
+#endif
 static kframe K_frames[K_MAX_CALL_DEPTH];
 static int K_depth;
 
@@ -525,10 +566,12 @@ extern const int K_sub_params[];
 extern const char *const K_qt_lib_fallback;
 #endif
 
+static void io_init(void); /* the pins and the clock (MILLIS) */
+
 /* End of the program: flush output, give main() its exit code. */
 RT_API int rt_finish(void)
 {
-    fflush(stdout);
+    K_FLUSH();
     return 0;
 }
 
@@ -536,12 +579,19 @@ RT_API void rt_init(int nvars, const char *argv0)
 {
     K_argv0 = argv0;
     /* RND differs from run to run, as in the VM (the address varies with ASLR). */
+#ifdef KAYTE_EMBEDDED
+    K_rnd = (uint64_t)kayte_hal_entropy() * 0x9E3779B97F4A7C15ULL ^ kayte_hal_micros();
+#else
     K_rnd = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uint64_t)(uintptr_t)&nvars;
+#endif
+    io_init();
     K_nvars = nvars;
     K_vars = rt_alloc(sizeof(kv) * (size_t)(nvars > 0 ? nvars : 1));
     for (int i = 0; i < nvars; i++)
         K_vars[i] = kv_int(0);
+#ifndef KAYTE_EMBEDDED
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 #ifdef KAYTE_APPLE_MOBILE
     /* An app starts in "/"; make relative paths mean "in the app bundle". */
     CFURLRef url = CFBundleCopyResourcesDirectoryURL(CFBundleGetMainBundle());
@@ -822,7 +872,7 @@ static int64_t K_col; /* output column, for QuickBASIC PRINT's "," and TAB */
 /* Writes n bytes to stdout, keeping track of the column. */
 static void kout(const char *s, size_t n)
 {
-    fwrite(s, 1, n, stdout);
+    K_WRITE(s, n);
     for (size_t j = 0; j < n; j++)
         K_col = s[j] == '\n' ? 0 : K_col + 1;
 }
@@ -840,11 +890,11 @@ RT_API void rt_print(int n)
         ktext t;
         kt_get(args[j], &t);
         if (j > 0)
-            fputc(' ', stdout);
-        fwrite(t.s, 1, t.len, stdout);
+            K_WRITE(" ", 1);
+        K_WRITE(t.s, t.len);
         kt_done(&t);
     }
-    fputc('\n', stdout);
+    K_WRITE("\n", 1);
     K_col = 0;
     release_args(args, n);
 }
@@ -899,10 +949,10 @@ RT_API void rt_qprint(int kind)
 /* INPUT: a line from stdin, without its line break ("" at the end). */
 RT_API void rt_input(void)
 {
-    fflush(stdout);
+    K_FLUSH();
     kbuf b = {0};
     int c;
-    while ((c = getchar()) != EOF && c != '\n') {
+    while ((c = K_GETC()) != EOF && c != '\n') {
         char ch = (char)c;
         kb_add(&b, &ch, 1);
     }
@@ -1201,7 +1251,8 @@ enum {
     BI_TAN, BI_ATN, BI_EXP, BI_LOG, BI_USING, BI_FOPEN, BI_FCLOSE, BI_FPRINT, BI_FREADLINE, BI_FREADFIELD,
     BI_EOF, BI_FREEFILE, BI_LOF, BI_KILL, BI_NAME, BI_FGET, BI_FPUT, BI_FSEEK, BI_FSEEKPOS, BI_FLOC,
     BI_FINPUTS, BI_MKI, BI_MKL, BI_MKS, BI_MKD, BI_CVI, BI_CVL, BI_CVS, BI_CVD, BI_BAND, BI_BOR, BI_BXOR,
-    BI_BNOT, BI_ERRCODE, BI_ERRMSG, BI_MIDSET, BI_LSET, BI_RSET
+    BI_BNOT, BI_ERRCODE, BI_ERRMSG, BI_MIDSET, BI_LSET, BI_RSET, BI_PINMODE, BI_DIGITALWRITE, BI_DIGITALREAD,
+    BI_ANALOGREAD, BI_ANALOGWRITE, BI_DELAY, BI_MILLIS, BI_MICROS
 };
 
 /* QuickBASIC's error numbers and messages (ERR, ERROR n) - the VM has the
@@ -1967,6 +2018,183 @@ static kv mk_cv(int id, kv v)
     return r;
 }
 
+/* ------------------------------------------------------------------ */
+/* Microcontroller I/O: PINMODE, DIGITALWRITE, DELAY, MILLIS ...       */
+/* ------------------------------------------------------------------ */
+
+/* On a board (KAYTE_EMBEDDED) these drive the hardware through the HAL.
+ * Elsewhere they're simulated, as in the VM (IOBuiltin in
+ * virtualmachine.pas): a pin keeps what was written to it, an input reads
+ * 0 (1 with a pull-up), ANALOGREAD gives 0, and KAYTE_GPIO_TRACE logs
+ * every change to stderr. */
+#define K_NPINS 256
+static const char *const K_pin_modes[] = {"INPUT", "OUTPUT", "INPUT_PULLUP", "INPUT_PULLDOWN"};
+#ifndef KAYTE_EMBEDDED
+static int64_t K_pin_level[K_NPINS];
+static uint64_t K_start_us;
+static int K_gpio_trace;
+#endif
+
+/* Microseconds from a fixed point (on a board: since it started). */
+static uint64_t io_now_us(void)
+{
+#if defined(KAYTE_EMBEDDED)
+    return kayte_hal_micros();
+#elif defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart / f.QuadPart * 1000000 + c.QuadPart % f.QuadPart * 1000000 / f.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+
+static void io_init(void)
+{
+#ifndef KAYTE_EMBEDDED
+    K_start_us = io_now_us();
+    const char *t = getenv("KAYTE_GPIO_TRACE");
+    K_gpio_trace = t && *t;
+#endif
+}
+
+#ifndef KAYTE_EMBEDDED
+static void io_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void io_trace(const char *fmt, ...)
+{
+    if (!K_gpio_trace)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    fflush(stdout);
+    fputs("[gpio] ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+#endif
+
+static kv io_builtin(int id, kv *a)
+{
+    int pin = 0;
+    if (id == BI_PINMODE || id == BI_DIGITALWRITE || id == BI_DIGITALREAD || id == BI_ANALOGREAD ||
+        id == BI_ANALOGWRITE) {
+        int64_t p = kv_to_int(a[0]);
+        if (p < 0 || p >= K_NPINS)
+            rt_error("pin %" PRId64 " is out of range (0 to %d)", p, K_NPINS - 1);
+        pin = (int)p;
+    }
+    switch (id) {
+    case BI_PINMODE: {
+        int mode = -1;
+        if (a[1].kind == K_STR) {
+            char *name = kv_cstr(a[1]), *b = name, *e;
+            while (isspace((unsigned char)*b))
+                b++;
+            for (e = b + strlen(b); e > b && isspace((unsigned char)e[-1]); e--)
+                ;
+            *e = '\0';
+            for (int m = 0; m < 4; m++)
+                if (strcasecmp(b, K_pin_modes[m]) == 0)
+                    mode = m;
+            free(name);
+        } else {
+            int64_t m = kv_to_int(a[1]);
+            if (m >= 0 && m < 4)
+                mode = (int)m;
+        }
+        if (mode < 0) {
+            ktext t;
+            kt_get(a[1], &t);
+            rt_error("PINMODE: unknown mode \"%s\" (INPUT, OUTPUT, INPUT_PULLUP or INPUT_PULLDOWN)", t.s);
+        }
+#ifdef KAYTE_EMBEDDED
+        if (kayte_hal_pin_mode(pin, mode) != 0)
+            rt_error("PINMODE: pin %d can't be %s on this board", pin, K_pin_modes[mode]);
+#else
+        if (mode == 2)
+            K_pin_level[pin] = 1;
+        else if (mode == 3)
+            K_pin_level[pin] = 0;
+        io_trace("pinMode %d %s", pin, K_pin_modes[mode]);
+#endif
+        return kv_int(0);
+    }
+    case BI_DIGITALWRITE: {
+        int level = kv_truthy(a[1]);
+#ifdef KAYTE_EMBEDDED
+        kayte_hal_digital_write(pin, level);
+#else
+        K_pin_level[pin] = level;
+        io_trace("pin %d = %d", pin, level);
+#endif
+        return kv_int(0);
+    }
+    case BI_DIGITALREAD:
+#ifdef KAYTE_EMBEDDED
+        return kv_int(kayte_hal_digital_read(pin) != 0);
+#else
+        return kv_int(K_pin_level[pin] != 0);
+#endif
+    case BI_ANALOGREAD: {
+#ifdef KAYTE_EMBEDDED
+        int v = kayte_hal_analog_read(pin);
+        if (v < 0)
+            rt_error("ANALOGREAD: pin %d has no analog input on this board", pin);
+        return kv_int(v);
+#else
+        return kv_int(0);
+#endif
+    }
+    case BI_ANALOGWRITE: {
+        int64_t v = kv_to_int(a[1]);
+        if (v < 0 || v > 255)
+            rt_error("ANALOGWRITE: the value must be 0 to 255, not %" PRId64, v);
+#ifdef KAYTE_EMBEDDED
+        if (kayte_hal_analog_write(pin, (int)v) != 0)
+            rt_error("ANALOGWRITE: pin %d has no PWM output on this board", pin);
+#else
+        K_pin_level[pin] = v;
+        io_trace("pin %d pwm %d", pin, (int)v);
+#endif
+        return kv_int(0);
+    }
+    case BI_DELAY: {
+        K_FLUSH();
+        int64_t ms = kv_to_int(a[0]);
+        if (ms > 0xFFFFFFFF)
+            ms = 0xFFFFFFFF;
+        if (ms > 0) {
+#if defined(KAYTE_EMBEDDED)
+            kayte_hal_delay_ms((uint32_t)ms);
+#elif defined(_WIN32)
+            Sleep((DWORD)ms);
+#else
+            struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+                ;
+#endif
+        }
+        return kv_int(0);
+    }
+    case BI_MILLIS:
+#ifdef KAYTE_EMBEDDED
+        return kv_int((int64_t)kayte_hal_millis());
+#else
+        return kv_int((int64_t)((io_now_us() - K_start_us) / 1000));
+#endif
+    default: /* BI_MICROS */
+#ifdef KAYTE_EMBEDDED
+        return kv_int((int64_t)io_now_us());
+#else
+        return kv_int((int64_t)(io_now_us() - K_start_us));
+#endif
+    }
+}
+
 static kv file_builtin(int id, kv *a, int n)
 {
     switch (id) {
@@ -2594,10 +2822,12 @@ RT_API void rt_builtin(int id, int n)
         break;
     }
     case BI_SLEEP: {
-        fflush(stdout);
+        K_FLUSH();
         int64_t secs = kv_to_int(a[0]);
         if (secs > 0) {
-#ifdef _WIN32
+#if defined(KAYTE_EMBEDDED)
+            kayte_hal_delay_ms((uint32_t)(secs > 4000000 ? 4000000000u : secs * 1000));
+#elif defined(_WIN32)
             Sleep((DWORD)(secs * 1000));
 #else
             struct timespec ts = {(time_t)secs, 0};
@@ -2609,6 +2839,10 @@ RT_API void rt_builtin(int id, int n)
     }
     case BI_INKEY:
         r = kv_str("", 0);
+        break;
+    case BI_PINMODE: case BI_DIGITALWRITE: case BI_DIGITALREAD: case BI_ANALOGREAD: case BI_ANALOGWRITE:
+    case BI_DELAY: case BI_MILLIS: case BI_MICROS:
+        r = io_builtin(id, a);
         break;
     case BI_QBSTR:
         if (a[0].kind == K_INT && a[0].i >= 0) {
@@ -2872,6 +3106,8 @@ static void qt_load(void)
         return;
 #if defined(KAYTE_APPLE_MOBILE)
     rt_error("QT/QML on iOS need the app built by scripts/build-kayte-ios.sh (Qt has no tvOS support)");
+#elif defined(KAYTE_EMBEDDED)
+    rt_error("QT/QML are not available on a microcontroller");
 #elif defined(KAYTE_NO_DYNLOAD)
     rt_error("QT/QML are not available on WebAssembly (no Qt there)");
 #else

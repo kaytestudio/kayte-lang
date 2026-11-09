@@ -165,6 +165,43 @@ type
 const
   RetVar = '__ret'; // a function's return value, read right after its CALL
 
+// The microcontroller built-ins, Arduino's names (PicoKayte): BI_* id and
+// argument counts, or 0.
+function IOBuiltin(const Name: string; out MinArgs, MaxArgs: Integer): Integer;
+begin
+  Result := 0;
+  MinArgs := 1;
+  MaxArgs := 1;
+  case Name of
+    'pinMode': Result := BI_PINMODE;
+    'digitalWrite': Result := BI_DIGITALWRITE;
+    'digitalRead': Result := BI_DIGITALREAD;
+    'analogRead': Result := BI_ANALOGREAD;
+    'analogWrite': Result := BI_ANALOGWRITE;
+    'delay': Result := BI_DELAY;
+    'millis': Result := BI_MILLIS;
+    'micros': Result := BI_MICROS;
+  end;
+  if Result in [BI_PINMODE, BI_DIGITALWRITE, BI_ANALOGWRITE] then
+    MinArgs := 2
+  else if Result in [BI_MILLIS, BI_MICROS] then
+    MinArgs := 0;
+  MaxArgs := MinArgs;
+end;
+
+// HIGH, LOW, INPUT, OUTPUT, INPUT_PULLUP, INPUT_PULLDOWN, or -1.
+function IOConstant(const Name: string): Integer;
+begin
+  case Name of
+    'LOW', 'INPUT': Result := 0;
+    'HIGH', 'OUTPUT': Result := 1;
+    'INPUT_PULLUP': Result := 2;
+    'INPUT_PULLDOWN': Result := 3;
+  else
+    Result := -1;
+  end;
+end;
+
 { TLoop }
 
 constructor TLoop.Create;
@@ -1265,6 +1302,13 @@ begin
         Col := FTok.Col;
         if (Name = 'true') then begin PushInt(1); Advance; Exit; end;
         if (Name = 'false') or (Name = 'null') or (Name = 'undefined') then begin PushInt(0); Advance; Exit; end;
+        // Arduino's pin levels and modes, unless the program has a variable of that name
+        if (IOConstant(Name) >= 0) and (FAsm.CurrentProgram.VariableMap.IndexOf(Resolve(Name)) < 0) then
+        begin
+          PushInt(IOConstant(Name));
+          Advance;
+          Exit;
+        end;
         if (Name = 'function') or (Name = 'var') or (Name = 'let') or (Name = 'const') or (Name = 'if') or
            (Name = 'while') or (Name = 'for') or (Name = 'return') then
           FailHere('expected a value');
@@ -1315,14 +1359,16 @@ begin
 end;
 
 function TJSCompiler.IsBuiltin(const Name: string): Boolean;
+var
+  MinA, MaxA: Integer;
 begin
   Result := (Name = 'print') or (Name = 'console.log') or (Name = 'alert') or (Name = 'msgbox') or
-            (Name = 'qt') or (Name = 'qml') or (Name = 'process');
+            (Name = 'qt') or (Name = 'qml') or (Name = 'process') or (IOBuiltin(Name, MinA, MaxA) > 0);
 end;
 
 procedure TJSCompiler.CallByName(const Name: string; Line, Col: Integer; WantValue: Boolean);
 var
-  N, Dest: Integer;
+  N, Dest, Id, MinA, MaxA: Integer;
   Call: TPendingJSCall;
 begin
   if (Name = 'print') or (Name = 'console.log') or (Name = 'alert') or (Name = 'msgbox') then
@@ -1335,6 +1381,18 @@ begin
     if (Name = 'alert') or (Name = 'msgbox') then
       Inc(N);
     Emit(BC_PRINT, [N]);
+    Exit;
+  end;
+
+  Id := IOBuiltin(Name, MinA, MaxA);
+  if Id > 0 then
+  begin
+    N := Arguments;
+    if (N < MinA) or (N > MaxA) then
+      Fail(Format('%s() takes %d argument(s), but this call passes %d', [Name, MinA, N]), Line, Col);
+    Emit(BC_BUILTIN, [Id, N]);
+    if not WantValue then
+      Emit(BC_POP, []);
     Exit;
   end;
 

@@ -1,0 +1,22 @@
+' Guess: a number game over the serial port - INPUT reads a line from it.
+' (Arduino IDE: set the Serial Monitor to 115200 baud and "Newline".)
+target = RND(100) + 1
+tries = 0
+PRINT "I'm thinking of a number from 1 to 100."
+DO
+    PRINT "Your guess?"
+    INPUT answer
+    TRY
+        guess = CInt(answer)
+    CATCH e
+        PRINT "'" & answer & "' isn't a number"
+        CONTINUE DO
+    END TRY
+    tries = tries + 1
+    IF guess < target THEN
+        PRINT "Higher"
+    ELSEIF guess > target THEN
+        PRINT "Lower"
+    END IF
+LOOP UNTIL guess = target
+PRINT "Got it in " & tries & " tries!"

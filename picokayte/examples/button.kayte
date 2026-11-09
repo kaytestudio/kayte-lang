@@ -1,0 +1,21 @@
+' Button: the LED follows a push button, and every press is counted.
+' On an ESP32 DevKit the BOOT button is GPIO 0 (pressed = LOW) and the LED GPIO 2.
+CONST BUTTON = 0
+CONST LED = 2
+
+PinMode BUTTON, INPUT_PULLUP
+PinMode LED, OUTPUT
+
+presses = 0
+was = HIGH
+PRINT "Press the button..."
+DO
+    now = DigitalRead(BUTTON)
+    DigitalWrite LED, now = LOW
+    IF now = LOW AND was = HIGH THEN
+        presses = presses + 1
+        PRINT "Pressed " & presses & " time(s), at " & Millis() & " ms"
+    END IF
+    was = now
+    Delay 20                     ' debounce, and lets the board do its own work
+LOOP

@@ -44,6 +44,7 @@ bin/kayte --compile examples/hello.kjs -o hello.bytecode
 source/      all the Pascal sources and the Lazarus projects: kayte.lpi (the compiler / VM), webgen,
              vb6interpreter, mathlibdylib, kfmlibgen; native/ C runtime, qt6/ Qt bridge, ios/ app template
 examples/    example programs (.kayte, .kjs), forms (.kfm) and QML
+picokayte/   PicoKayte: Kayte for ESP32 and Arduino boards (tool, board HALs, examples)
 scripts/     build scripts: macOS / Linux containers / musl, Qt, iOS, .kfm and mathlib libraries
 docs/        guides (musl builds, KayteIDE), grammar and images
 kfrm/        KFRM form framework units (parser, renderer, event router) used by vb6interpreter
@@ -300,6 +301,7 @@ String positions start at 1, as in VB, and a trailing `$` is accepted (`LEFT$`, 
 | Rounding and conversion | `CINT(x)` / `CLNG` (nearest, to even on .5), `INT(x)` (down: `INT(-2.7)` is -3), `FIX(x)` (toward 0: -2), `ROUND(x[, decimals])` (to even on .5), `CDBL(x)` / `CSNG` (to a double), `STR(x)` / `CSTR` |
 | Arrays | `ARRAY(a, b, ...)`, `SPLIT(s[, separator])`, `JOIN(array[, separator])`, `LEN(array)`, `UBOUND(array[, dimension])`, `LBOUND` |
 | Types | `TYPENAME(x)` (`Integer`, `Double`, `String`, `Array` or the class name), `ISARRAY(x)` |
+| Microcontroller I/O | `PINMODE`, `DIGITALWRITE`, `DIGITALREAD(pin)`, `ANALOGREAD(pin)`, `ANALOGWRITE`, `DELAY(ms)`, `MILLIS()`, `MICROS()`: real pins on a board, simulated elsewhere (see [PicoKayte](picokayte/README.md)) |
 
 A SUB or FUNCTION of your own with the same name replaces the built-in function. Wrong argument counts are compile errors.
 
@@ -746,6 +748,18 @@ Per-platform notes:
 - **WebAssembly:** has no processes or Qt, so `PROCESS` and `QT` stop with a runtime error. A program with `TRY` is built with WebAssembly exception handling, so it needs a runtime that has it (`wasmtime -W exceptions=y`).
 - **iOS / tvOS:** `PROCESS` is unavailable, and QT apps for iOS are built with `scripts/build-kayte-ios.sh`.
 
+### ✅ Microcontrollers: ESP32 and Arduino (PicoKayte)
+**Status:** Implemented (ESP32 through the Arduino core or ESP-IDF 5.x; other 32-bit Arduino boards)
+
+`picokayte/picokayte` turns a program into an Arduino sketch or an ESP-IDF project. It builds the `--native` C with the board's own toolchain and the same runtime, so the whole language runs on the board. `PRINT` and `INPUT` use the serial port. Programs also get Arduino-style built-ins: `PINMODE`, `DIGITALWRITE`, `DIGITALREAD`, `ANALOGREAD`, `ANALOGWRITE`, `DELAY`, `MILLIS` and `MICROS`, with the constants `HIGH`, `LOW`, `OUTPUT`, `INPUT_PULLUP` and `INPUT_PULLDOWN`.
+
+```bash
+picokayte/picokayte arduino picokayte/examples/blink.kayte --fqbn esp32:esp32:esp32 --port /dev/cu.usbserial-0001
+picokayte/picokayte esp-idf picokayte/examples/blink.kayte --target esp32 --port /dev/cu.usbserial-0001
+```
+
+On the desktop, the VM and native builds simulate the pins (`KAYTE_GPIO_TRACE=1` logs them). See **[picokayte/README.md](picokayte/README.md)**.
+
 **Experimental direct ARM64 emitter:** `--native-arm64` is an older backend that writes Mach-O machine code directly (`source/KayteArm64.pas`, `source/kayte_arm64_emit.c`). It supports only a few integer opcodes, and current macOS refuses to launch the static executables it produces. It's kept for development of that backend only.
 
 ---
@@ -946,6 +960,7 @@ git push origin feature/my-awesome-feature
 ### In This Repository
 - **source/qt6/README.md**: Qt6, QML, form files and iOS reference
 - **examples/**: example programs
+- **[picokayte/README.md](picokayte/README.md)**: PicoKayte, Kayte on ESP32 and Arduino boards
 - **CONTRIBUTING.md**, **CODE_OF_CONDUCT.md**
 - **[docs/INDEX.md](docs/INDEX.md)**: overview of the build system files
 - **[docs/QUICKSTART_KAYTE.md](docs/QUICKSTART_KAYTE.md)**: quick start for building with musl

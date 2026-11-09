@@ -201,7 +201,9 @@ begin
     Code.Add('');
     Code.Add('#include "' + RuntimeFile + '"');
     Code.Add('');
-    Code.Add('int main(int argc, char **argv)');
+    // main, or kayte_main when built for a microcontroller (KAYTE_EMBEDDED,
+    // picokayte/), whose setup() / app_main() calls it.
+    Code.Add('int KAYTE_MAIN(int argc, char **argv)');
     Code.Add('{');
     Code.Add('    int target = 0;');
     Code.Add('    (void)argc;');
@@ -290,7 +292,7 @@ begin
     end;
 
     Code.Add('K_end:');
-    Code.Add('    fflush(stdout);');
+    Code.Add('    K_FLUSH();');
     Code.Add('    return 0;');
     Code.Add('K_dispatch:');
     Code.Add('    switch (target) {');
